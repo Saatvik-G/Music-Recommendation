@@ -107,13 +107,21 @@ export async function POST(req: NextRequest) {
     // Enrich any missing cover images with fast artwork lookup
     const enrichedRecs = await enrichRecommendationsWithArtwork(combined);
 
-    return NextResponse.json({
-      interpretation: aiResult.interpretation || `Search results for "${query}"`,
-      recommendations: enrichedRecs,
-      spotifyTotal: spotifyTracks.length,
-      youtubeTotal: youtubeTracks.length,
-      catalogTotal: combined.length,
-    });
+    return new NextResponse(
+      JSON.stringify({
+        interpretation: aiResult.interpretation || `Search results for "${query}"`,
+        recommendations: enrichedRecs,
+        spotifyTotal: spotifyTracks.length,
+        youtubeTotal: youtubeTracks.length,
+        catalogTotal: combined.length,
+      }),
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+        },
+      }
+    );
   } catch (error) {
     console.error("Search API error:", error);
     return NextResponse.json({ error: "Search failed" }, { status: 500 });
