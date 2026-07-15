@@ -4,6 +4,7 @@ import { searchTrackCatalog } from "@/lib/lastfm";
 import { searchSpotifyTracks } from "@/lib/spotify";
 import { searchYouTubeTracks } from "@/lib/youtube";
 import { enrichRecommendationsWithArtwork } from "@/lib/artwork";
+import { fetchAppleMusicTrending } from "@/lib/apple-music";
 
 // Helper to wrap slow AI calls with a fast timeout (1.8s) so the user gets sub-second response
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
@@ -13,15 +14,82 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Pr
   ]);
 }
 
+function normalizeString(str: string): string {
+  return str
+    .toLowerCase()
+    .replace(/[^\w\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getLevenshteinDistance(a: string, b: string): number {
+  const tmp = [];
+  for (let i = 0; i <= a.length; i++) {
+    tmp[i] = [i];
+  }
+  for (let j = 0; j <= b.length; j++) {
+    tmp[0][j] = j;
+  }
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      tmp[i][j] = Math.min(
+        tmp[i - 1][j] + 1,
+        tmp[i][j - 1] + 1,
+        tmp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+  }
+  return tmp[a.length][b.length];
+}
+
+function detectCountry(req: NextRequest): string {
+  const vercelCountry = req.headers.get("x-vercel-ip-country");
+  if (vercelCountry && vercelCountry.length === 2) {
+    return vercelCountry.toLowerCase();
+  }
+
+  const acceptLang = req.headers.get("accept-language");
+  if (acceptLang) {
+    const match = acceptLang.match(/([a-z]{2})-([A-Z]{2})/);
+    if (match && match[2]) {
+      return match[2].toLowerCase();
+    }
+  }
+
+  return "in";
+}
+
+function matchesAppleMusic(item: MusicRecommendation, charts: any[]): { matched: boolean; index: number } {
+  const normTitle = normalizeString(item.title || "");
+  const normArtist = normalizeString(item.artist || "");
+
+  for (let i = 0; i < charts.length; i++) {
+    const song = charts[i];
+    const normSongName = normalizeString(song.name || "");
+    const normSongArtist = normalizeString(song.artistName || "");
+
+    if (normTitle === normSongName && normArtist === normSongArtist) {
+      return { matched: true, index: i };
+    }
+
+    if (normTitle === normSongName && (normArtist.includes(normSongArtist) || normSongArtist.includes(normArtist))) {
+      return { matched: true, index: i };
+    }
+  }
+  return { matched: false, index: -1 };
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { query, type = "text", page = 1 } = await req.json();
+    const { query, type = "text", page = 1, country: reqCountry } = await req.json();
     if (!query) return NextResponse.json({ error: "Query required" }, { status: 400 });
+
+    const country = (reqCountry || detectCountry(req) || "in").toLowerCase();
 
     const aiFallback: AIResponse = { interpretation: `Curated music matches for "${query}"`, recommendations: [] };
 
-    // Concurrently fetch AI vibe recommendations (1.8s max timeout), Spotify, YouTube, and Last.fm catalog search!
-    const [aiResult, spotifyTracks, youtubeTracks, lastfmTracks] = await Promise.all([
+    // Concurrently fetch AI vibe recommendations, Spotify, YouTube, Last.fm, and Apple Music charts!
+    const [aiResult, spotifyTracks, youtubeTracks, lastfmTracks, appleMusicCharts] = await Promise.all([
       withTimeout(
         type === "emoji" ? emojiSearch(query) : naturalLanguageSearch(query),
         1800,
@@ -30,9 +98,10 @@ export async function POST(req: NextRequest) {
       searchSpotifyTracks(query, 12).catch(() => []),
       searchYouTubeTracks(query, 6).catch(() => []),
       searchTrackCatalog(query, 12, page).catch(() => []),
+      fetchAppleMusicTrending(country, 50).catch(() => []),
     ]);
 
-    // Format Spotify catalog matches with actual Spotify global popularity score (0-100)
+    // Format Spotify catalog matches
     const spotifyRecs: MusicRecommendation[] = (spotifyTracks || []).map((t) => ({
       title: t.name,
       artist: t.artist,
@@ -47,7 +116,7 @@ export async function POST(req: NextRequest) {
       popularity: t.popularity || 85,
     }));
 
-    // Format AI recommendations with high relevance score
+    // Format AI recommendations
     const aiRecs: MusicRecommendation[] = (aiResult.recommendations || []).map((r, idx) => ({
       ...r,
       popularity: r.popularity || Math.max(90 - idx * 2, 70),
@@ -101,11 +170,76 @@ export async function POST(req: NextRequest) {
     addUnique(youtubeRecs);
     addUnique(lastfmRecs);
 
-    // SORT BY GLOBAL POPULARITY & RATING (Highest rated & most streamed songs first!)
-    combined.sort((a, b) => (b.popularity || 70) - (a.popularity || 70));
+    // Rank matching Last.fm tracks listener/popularity map
+    const lastfmListenersMap = new Map<string, number>();
+    for (const t of (lastfmTracks || [])) {
+      const key = `${normalizeString(t.artist || "")}-${normalizeString(t.name || "")}`;
+      const listeners = Number(t.listeners) || 0;
+      lastfmListenersMap.set(key, listeners);
+    }
 
-    // Enrich any missing cover images with fast artwork lookup
-    const enrichedRecs = await enrichRecommendationsWithArtwork(combined);
+    const itemsWithPopularity = combined.map((item) => {
+      const key = `${normalizeString(item.artist || "")}-${normalizeString(item.title || "")}`;
+      let listeners = lastfmListenersMap.get(key) || 0;
+
+      if (!listeners) {
+        if (item.popularity) {
+          listeners = item.popularity * 1000;
+        } else {
+          listeners = 1000;
+        }
+      }
+
+      const appleMatch = matchesAppleMusic(item, appleMusicCharts);
+
+      return {
+        item,
+        appleMatch,
+        listeners,
+      };
+    });
+
+    itemsWithPopularity.sort((a, b) => {
+      if (a.appleMatch.matched && !b.appleMatch.matched) return -1;
+      if (!a.appleMatch.matched && b.appleMatch.matched) return 1;
+
+      if (a.appleMatch.matched && b.appleMatch.matched) {
+        return a.appleMatch.index - b.appleMatch.index;
+      }
+
+      return b.listeners - a.listeners;
+    });
+
+    const sortedCombined = itemsWithPopularity.map((x) => x.item);
+
+    // Enrichment
+    const enrichedRecs = await enrichRecommendationsWithArtwork(sortedCombined);
+
+    // Is What You Meant / "Did you mean" logic
+    let didYouMean: string | undefined = undefined;
+    const normQuery = normalizeString(query);
+    if (normQuery.length > 2 && appleMusicCharts.length > 0) {
+      for (const song of appleMusicCharts) {
+        const normName = normalizeString(song.name || "");
+        const normArtist = normalizeString(song.artistName || "");
+
+        if (normName !== normQuery && getLevenshteinDistance(normQuery, normName) <= 2) {
+          didYouMean = `${song.name} by ${song.artistName}`;
+          break;
+        }
+        if (normArtist !== normQuery && getLevenshteinDistance(normQuery, normArtist) <= 2) {
+          didYouMean = song.artistName;
+          break;
+        }
+        if (normName.includes(normQuery) && normName !== normQuery) {
+          didYouMean = `${song.name} by ${song.artistName}`;
+          break;
+        }
+      }
+    }
+
+    // Structured serverless logging for debuggability
+    console.log(`[Search Route Log] query="${query}" country="${country}" combinedCount=${combined.length} didYouMean="${didYouMean || ""}"`);
 
     return new NextResponse(
       JSON.stringify({
@@ -114,6 +248,7 @@ export async function POST(req: NextRequest) {
         spotifyTotal: spotifyTracks.length,
         youtubeTotal: youtubeTracks.length,
         catalogTotal: combined.length,
+        didYouMean,
       }),
       {
         headers: {
@@ -122,8 +257,13 @@ export async function POST(req: NextRequest) {
         },
       }
     );
-  } catch (error) {
-    console.error("Search API error:", error);
+  } catch (error: any) {
+    // Vercel serverless error logging
+    console.error(`[Vercel Serverless Search Error] query failed:`, {
+      message: error?.message,
+      stack: error?.stack,
+    });
     return NextResponse.json({ error: "Search failed" }, { status: 500 });
   }
 }
+

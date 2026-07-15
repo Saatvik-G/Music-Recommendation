@@ -14,7 +14,14 @@ export async function GET(
       getTagTopArtists(decodedGenre, 12).catch(() => []),
       getTagTopTracks(decodedGenre, 8).catch(() => []),
     ]);
-    return NextResponse.json({ ...aiData, lastfmArtists: topArtists, lastfmTracks: topTracks });
+    return NextResponse.json(
+      { ...aiData, lastfmArtists: topArtists, lastfmTracks: topTracks },
+      {
+        headers: {
+          "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=3600",
+        },
+      }
+    );
   } catch (error) {
     console.error("Genre API error:", error);
     return NextResponse.json({ error: "Genre data fetch failed" }, { status: 500 });

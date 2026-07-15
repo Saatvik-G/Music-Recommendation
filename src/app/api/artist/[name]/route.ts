@@ -14,7 +14,14 @@ export async function GET(
       getArtistTopTags(artistName).catch(() => []),
       getArtistTopTracks(artistName, 8).catch(() => []),
     ]);
-    return NextResponse.json({ info, similar, tags, topTracks });
+    return NextResponse.json(
+      { info, similar, tags, topTracks },
+      {
+        headers: {
+          "Cache-Control": "public, s-maxage=86400, stale-while-revalidate=3600",
+        },
+      }
+    );
   } catch (error) {
     console.error("Artist API error:", error);
     return NextResponse.json({ error: "Artist data fetch failed" }, { status: 500 });

@@ -33,7 +33,12 @@ function SearchResults() {
           body: JSON.stringify({ query: q, type, page: 1 }),
         });
         const data = await res.json();
-        setResults(data.recommendations || [], data.interpretation || "");
+        const items = data.recommendations || [];
+        // Attach metadata didYouMean to the results array reference
+        if (data.didYouMean) {
+          (items as any).didYouMean = data.didYouMean;
+        }
+        setResults(items, data.interpretation || "");
         addToHistory(q, type);
       } catch (err) {
         console.error(err);
@@ -119,6 +124,20 @@ function SearchResults() {
               <Sparkles size={16} className="text-amber-400 mt-0.5 flex-shrink-0" />
               <p className="text-xs sm:text-sm text-zinc-200 leading-relaxed font-medium">{interpretation}</p>
             </motion.div>
+          )}
+
+          {/* Did You Mean Suggestion indicator */}
+          {results.length > 0 && (results as any).didYouMean && (
+            <div className="text-xs text-amber-300 font-semibold px-4 flex items-center gap-1.5">
+              <span>Did you mean:</span>
+              <a
+                href={`/search?q=${encodeURIComponent((results as any).didYouMean)}&type=${type}`}
+                className="underline hover:text-amber-400 cursor-pointer"
+              >
+                {(results as any).didYouMean}
+              </a>
+              <span>?</span>
+            </div>
           )}
 
           {/* Filter Bar */}
